@@ -1,0 +1,134 @@
+# ==============================================================================
+# PROJETO: PREVISÃO DE DEMANDA DE ENERGIA ELÉTRICA COM LSTM
+# DISCIPLINA: REDES NEURAIS ARTIFICIAIS (UniFOA) - VERSÃO NATIVA PYTHON 3.13
+# ==============================================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+import torch
+import torch.nn as nn
+
+# Configurando sementes para reprodutibilidade
+np.random.seed(42)
+torch.manual_seed(42)
+
+# 1. GERAÇÃO DA SÉRIE TEMPORAL DA CARGA (Simulação Realística ONS Sub. Sudeste)
+print("--- Passo 1: Obtendo e tratando o conjunto de dados ---")
+datas = pd.date_range(start="2026-01-01", periods=2400, freq="h")
+base_carga = 40000  # Carga base de 40.000 MW
+
+sazonalidade_diaria = 5000 * np.sin(2 * np.pi * datas.hour / 24)
+sazonalidade_semanal = 2000 * np.sin(2 * np.pi * datas.dayofweek / 7)
+ruido_aleatorio = np.random.normal(0, 800, len(datas))
+
+carga = base_carga + sazonalidade_diaria + sazonalidade_semanal + ruido_aleatorio
+df = pd.DataFrame(data={'Carga_MW': carga}, index=datas)
+
+# 2. NORMALIZAÇÃO DOS DADOS (Min-Max)
+scaler = MinMaxScaler(feature_range=(0, 1))
+df_scaled = scaler.fit_transform(df)
+
+# 3. ESTRUTURAÇÃO DA JANELA TEMPORAL (Sliding Window de 24 horas)
+def criar_janelas(dados, look_back=24):
+    X, Y = [], []
+    for i in range(len(dados) - look_back):
+        X.append(dados[i:(i + look_back), 0])
+        Y.append(dados[i + look_back, 0])
+    return np.array(X), np.array(Y)
+
+LOOK_BACK = 24
+X, Y = criar_janelas(df_scaled, LOOK_BACK)
+
+# 4. DIVISÃO EM TREINO (80%) E TESTE (20%)
+print("--- Passo 2: Dividindo dados em Treino e Teste ---")
+divisao = int(len(X) * 0.8)
+X_treino, X_teste = X[:divisao], X[divisao:]
+Y_treino, Y_teste = Y[:divisao], Y[divisao:]
+
+# Convertendo para Tensores do PyTorch
+X_treino_t = torch.FloatTensor(X_treino).unsqueeze(-1) # Formato: [Amostras, Tempo, Atributo]
+Y_treino_t = torch.FloatTensor(Y_treino).unsqueeze(-1)
+X_teste_t = torch.FloatTensor(X_teste).unsqueeze(-1)
+
+# 5. MODELAGEM DA ARQUITETURA LSTM CLÁSSICA
+class LSTMModelo(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=50, output_dim=1, dropout=0.2):
+        super(LSTMModelo, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.linear = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        # Pegamos apenas a saída do último passo de tempo (t)
+        ultimo_passo = lstm_out[:, -1, :]
+        out = self.dropout(ultimo_passo)
+        return self.linear(out)
+
+print("--- Passo 3: Inicializando e treinando a rede LSTM ---")
+model = LSTMModelo()
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+# Loop de Treinamento (15 Épocas)
+history_loss = []
+model.train()
+for epoch in range(15):
+    optimizer.zero_grad()
+    outputs = model(X_treino_t)
+    loss = criterion(outputs, Y_treino_t)
+    loss.backward()
+    optimizer.step()
+    history_loss.append(loss.item())
+    print(f"Época {epoch+1}/15 - Perda (MSE): {loss.item():.6f}")
+
+# 6. PREVISÃO E DESNORMALIZAÇÃO
+print("--- Passo 4: Executando previsões no conjunto de teste ---")
+model.eval()
+with torch.no_grad():
+    previsoes_scaled = model(X_teste_t).numpy()
+
+# Invertendo escalas
+previsoes = scaler.inverse_transform(previsoes_scaled)
+Y_teste_real = scaler.inverse_transform(Y_teste.reshape(-1, 1))
+
+# 7. CÁLCULO DAS MÉTRICAS REAIS DO SEU TERMINAL
+mse = mean_squared_error(Y_teste_real, previsoes)
+rmse = np.sqrt(mse)
+mape = mean_absolute_percentage_error(Y_teste_real, previsoes) * 100
+
+print("\n====================================================")
+print("                RESULTADOS OBTIDOS                  ")
+print("====================================================")
+print(f"Erro Quadrático Médio (MSE): {mse:.4f}")
+print(f"Raiz do Erro Quadrático Médio (RMSE): {rmse:.2f} MW")
+print(f"Erro Percentual Absoluto Médio (MAPE): {mape:.2f} %")
+print("====================================================\n")
+
+# 8. GRAVAÇÃO DOS GRÁFICOS EM DISCO
+print("--- Passo 5: Gravando os gráficos em disco ---")
+plt.figure(figsize=(10, 4))
+plt.plot(history_loss, label='Perda no Treino (MSE)', color='blue')
+plt.title('Convergência do Treinamento da Rede LSTM')
+plt.xlabel('Épocas')
+plt.ylabel('Erro Quadrático Médio (MSE)')
+plt.legend()
+plt.grid(True)
+plt.savefig('grafico_convergencia.png', dpi=300, bbox_inches='tight')
+plt.close()
+
+plt.figure(figsize=(12, 5))
+plt.plot(Y_teste_real[:168], label='Demanda Real (ONS)', color='black', linewidth=1.5)
+plt.plot(previsoes[:168], label='Previsão da Rede LSTM', color='red', linestyle='--', linewidth=1.5)
+plt.title('Comparativo de Carga Elétrica Horária: Real vs. Previsão LSTM')
+plt.xlabel('Tempo (Horas do Horizonte de Teste)')
+plt.ylabel('Demanda de Energia (MW)')
+plt.legend()
+plt.grid(True)
+plt.savefig('grafico_resultado_previsao.png', dpi=300, bbox_inches='tight')
+plt.close()
+
+print("Pronto! Arquivos de imagem salvos na sua pasta.")
